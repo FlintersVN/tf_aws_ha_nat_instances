@@ -1,0 +1,120 @@
+Content-Type: multipart/mixed; boundary="//"
+MIME-Version: 1.0
+
+--//
+Content-Type: text/cloud-config; charset="us-ascii"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+Content-Disposition: attachment; filename="cloud-config.txt"
+
+#cloud-config
+# -*- YAML -*-
+apt_upgrade: true
+locale: en_US.UTF-8
+packages:
+ - traceroute
+ - nmap
+ - keepalived
+ - telnet
+write_files:
+-   path: /lib/systemd/system/awsnycast.service
+    content: |
+        [Unit]
+        Description=Job that runs AWSnycast
+
+        [Service]
+        Type=simple
+        ExecStart=/usr/bin/AWSnycast
+        Restart=always
+        RestartSec=1min
+-   path: /etc/awsnycast.yaml
+    content: |
+        ---
+        poll_time: 300
+        healthchecks:
+            public:
+                type: ping
+                destination: 8.8.8.8
+                rise: 2
+                fall: 10
+                every: 1
+        routetables:
+             my_az:
+                find:
+                    type: and
+                    config:
+                      filters:
+                        - type: by_tag
+                          config:
+                              key: az
+                              value: ${azs}
+                        - type: by_tag
+                          config:
+                              key: type
+                              value: private
+                        - type: by_tag
+                          config:
+                              key: AWSnycast
+                              value: enabled
+                manage_routes:
+                   - cidr: 0.0.0.0/0
+                     instance: SELF
+                     healthcheck: public
+                     never_delete: true
+             other_azs:
+                find:
+                    type: and
+                    config:
+                        filters:
+                          - type: by_tag
+                            not: true
+                            config:
+                                key: az
+                                value: ${azs}
+                          - type: by_tag
+                            config:
+                                key: type
+                                value: private
+                          - type: by_tag
+                            config:
+                                key: AWSnycast
+                                value: enabled
+                manage_routes:
+                  - cidr: 0.0.0.0/0
+                    instance: SELF
+                    healthcheck: public
+                    if_unhealthy: true
+cloud_final_modules:
+- [scripts-user, always]
+
+--//
+Content-Type: text/x-shellscript; charset="us-ascii"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+Content-Disposition: attachment; filename="userdata.txt"
+
+#!/bin/bash
+modprobe ip_conntrack
+sysctl -q -w net.ipv4.ip_forward=1
+sysctl -q -w net.netfilter.nf_conntrack_max=655361
+sysctl -q -w net.nf_conntrack_max=655361
+iptables -N LOGGINGF
+iptables -N LOGGINGI
+iptables -A LOGGINGF -m limit --limit 2/min -j LOG --log-prefix "IPTables-FORWARD-Dropped: " --log-level 4
+iptables -A LOGGINGI -m limit --limit 2/min -j LOG --log-prefix "IPTables-INPUT-Dropped: " --log-level 4
+iptables -A LOGGINGF -j DROP
+iptables -A LOGGINGI -j DROP
+iptables -A FORWARD -s ${vpc_cidr} -j ACCEPT
+iptables -A FORWARD -j LOGGINGF
+iptables -P FORWARD DROP
+iptables -I FORWARD -m state --state "ESTABLISHED,RELATED" -j ACCEPT
+iptables -t nat -I POSTROUTING -s ${vpc_cidr} -d 0.0.0.0/0 -j MASQUERADE
+iptables -A INPUT -s ${vpc_cidr} -j ACCEPT
+iptables -A INPUT -p tcp --dport 22 -m state --state NEW -j ACCEPT
+iptables -I INPUT -m state --state "ESTABLISHED,RELATED" -j ACCEPT
+iptables -I INPUT -i lo -j ACCEPT
+iptables -A INPUT -j LOGGINGI
+iptables -P INPUT DROP
+sh -c "which AWSnycast || { cd /tmp && wget ${awsnycast_deb_url} && dpkg -i awsnycast_*.deb && rm *.deb; }"
+systemctl start awsnycast
+--//
